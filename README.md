@@ -29,4 +29,4 @@ bus = pbus.RedisBus(host='127.0.0.1')
 bus.publish('test', 'Hello')
 ```
 
-[Click to view more information!]('https://github.com/sintrb/pbus')
+[Click to view more information!](https://github.com/sintrb/pbus)
