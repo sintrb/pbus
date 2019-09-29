@@ -2,4 +2,9 @@ CHANGES
 ===============
 1.0.0
 
-- first version
+- First version
+
+1.1.0
+
+- Support MQTT and RabbitMQ
+- Support connect with URI
