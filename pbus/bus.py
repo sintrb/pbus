@@ -14,6 +14,9 @@ def decode_data(text):
     return json.loads(text)
 
 
+LOCALHOST = "localhost"
+
+
 class BasePubSub(object):
     def close(self):
         '''close PubSub'''
@@ -97,7 +100,7 @@ class RedisBus(BaseBus):
         def close(self):
             self.ps.close()
 
-    def __init__(self, host='127.0.0.1', port=6379, password=None, channel_prefix=None, db=0):
+    def __init__(self, host=LOCALHOST, port=6379, password=None, channel_prefix=None, db=0):
         import redis
         self.host = host
         self.port = port
@@ -150,7 +153,7 @@ class MQTTBus(BaseBus):
     connected = False
     subscriber_map = {}
 
-    def __init__(self, host='127.0.0.1', port=1883, username=None, password=None, channel_prefix=None):
+    def __init__(self, host=LOCALHOST, port=1883, username=None, password=None, channel_prefix=None):
         import uuid
         from paho.mqtt.client import Client
         self.host = host
@@ -257,7 +260,7 @@ class RabbitMQBus(BaseBus):
             con = self.rbmqchannel.connection
             con.close()
 
-    def __init__(self, host='127.0.0.1', port=5672, username=None, password=None, exchange=None, channel_prefix=None):
+    def __init__(self, host=LOCALHOST, port=5672, username=None, password=None, exchange=None, channel_prefix=None):
         self.host = host
         self.port = port
         self.username = username
@@ -303,6 +306,116 @@ class RabbitMQBus(BaseBus):
                                        body=encode_data(data))
 
 
+class MemoryBus(BaseBus):
+    class MemoryBusPubSub(BasePubSub):
+        def __init__(self, bus, queue, ful_channel):
+            self.bus = bus
+            self.queue = queue
+            self.ful_channel = ful_channel
+
+        listened = False
+        subscribed = True
+
+        def listen(self):
+            self.listened = True
+            while self.listened:
+                data = decode_data(self.queue.get())
+                yield data
+
+        def close(self):
+            self.listened = False
+            self.subscribed = False
+            self.bus.del_pubsub(self)
+
+    def add_pubsub(self, pubsub):
+        ful_channel = pubsub.ful_channel
+        if self.exchange not in MemoryBus._EXCHANGE_MAP:
+            MemoryBus._EXCHANGE_MAP[self.exchange] = {}
+        if ful_channel not in MemoryBus._EXCHANGE_MAP[self.exchange]:
+            MemoryBus._EXCHANGE_MAP[self.exchange][ful_channel] = list()
+        MemoryBus._EXCHANGE_MAP[self.exchange][ful_channel].append(pubsub)
+        return len(MemoryBus._EXCHANGE_MAP[self.exchange][ful_channel])
+
+    def del_pubsub(self, pubsub):
+        if self.exchange in MemoryBus._EXCHANGE_MAP:
+            ful_channel = pubsub.ful_channel
+            if ful_channel in MemoryBus._EXCHANGE_MAP[self.exchange]:
+                MemoryBus._EXCHANGE_MAP[self.exchange].remove(pubsub)
+                return MemoryBus._EXCHANGE_MAP[self.exchange][ful_channel]
+        return 0
+
+    _EXCHANGE_MAP = {}
+
+    def __init__(self, exchange=None, channel_prefix=None):
+        self.exchange = exchange or 'pbus'
+        self.channel_prefix = channel_prefix
+        self.busid = str(id(self))
+
+    def subscriber(self, channel):
+        ful_channel = self._get_ful_channel(channel)
+        try:
+            from Queue import Queue
+        except:
+            from queue import Queue
+        queue = Queue()
+        pubsub = MemoryBus.MemoryBusPubSub(self, queue, ful_channel)
+        self.add_pubsub(pubsub)
+        return pubsub
+
+    def publish(self, channel, data):
+        ex = MemoryBus._EXCHANGE_MAP.get(self.exchange)
+        if ex:
+            for pubsub in ex.get(self._get_ful_channel(channel), []):
+                pubsub.queue.put(encode_data(data))
+
+
+class KafkaBus(BaseBus):
+    class KafkaBusPubSub(BasePubSub):
+        def __init__(self, bus, ful_channel):
+            self.bus = bus
+            self.ful_channel = ful_channel
+
+        listened = False
+        subscribed = True
+
+        def listen(self):
+            self.listened = True
+            from kafka import KafkaConsumer
+            cs = KafkaConsumer(self.ful_channel, bootstrap_servers=self.bus.bootstrap_servers, sasl_plain_username=self.bus.username, sasl_plain_password=self.bus.password)
+            for v in cs:
+                yield decode_data(v.value.decode('utf8'))
+                if not self.listened:
+                    break
+
+        def close(self):
+            self.listened = False
+            self.subscribed = False
+
+    def __init__(self, host=LOCALHOST, port=9092, username=None, password=None, partition=None, channel_prefix=None):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.partition = partition
+        self.channel_prefix = channel_prefix
+        self._kafka = None
+
+    @property
+    def bootstrap_servers(self):
+        return '%s:%s' % (self.host, self.port)
+
+    def subscriber(self, channel):
+        ful_channel = self._get_ful_channel(channel)
+        pubsub = KafkaBus.KafkaBusPubSub(self, ful_channel)
+        return pubsub
+
+    def publish(self, channel, data):
+        if self._kafka == None:
+            import kafka
+            self._kafka = kafka.KafkaProducer(bootstrap_servers=self.bootstrap_servers, sasl_plain_username=self.username, sasl_plain_password=self.password)
+        self._kafka.send(self._get_ful_channel(channel), value=encode_data(data).encode('utf8'), partition=self.partition)
+
+
 def connect(uri):
     '''
     Connect to bus server with uri.
@@ -321,13 +434,19 @@ def connect(uri):
         rs = re.findall('^/(\d+)$', res.path or '')
         if rs:
             db = int(rs[0])
-        bus = RedisBus(host=res.hostname, port=int(res.port or 6379), password=res.password or None, db=db)
+        bus = RedisBus(host=res.hostname or 'localhost', port=int(res.port or 6379), password=res.password or None, db=db)
     elif res.scheme == 'mqtt':
         # mqtt
-        bus = MQTTBus(host=res.hostname, port=int(res.port or 1883), username=res.username or None, password=res.password or None)
+        bus = MQTTBus(host=res.hostname or 'localhost', port=int(res.port or 1883), username=res.username or None, password=res.password or None)
     elif res.scheme == 'amqp':
         # rabbitmq
-        bus = RabbitMQBus(host=res.hostname, port=int(res.port or 5672), username=res.username or None, password=res.password or None, exchange=(res.path or '').lstrip('/'))
+        bus = RabbitMQBus(host=res.hostname or 'localhost', port=int(res.port or 5672), username=res.username or None, password=res.password or None, exchange=(res.path or '').lstrip('/'))
+    elif res.scheme == 'memory':
+        # memory
+        bus = MemoryBus(exchange=(res.path or '').lstrip('/') or 'default')
+    elif res.scheme == 'kafka':
+        # kafka
+        bus = KafkaBus(host=res.hostname or 'localhost', port=int(res.port or 9092), username=res.username or None, password=res.password or None)
     else:
         raise Exception('Unknow uri: %s' % uri)
     return bus

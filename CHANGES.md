@@ -8,3 +8,8 @@ CHANGES
 
 - Support MQTT and RabbitMQ
 - Support connect with URI
+
+
+1.2.0
+
+- Support Memory
