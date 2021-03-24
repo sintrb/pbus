@@ -43,9 +43,57 @@ class Lock(object):
         # print('released', self.name)
 
 
+class FuncBus(object):
+    _func_map = {}
+    _runing = False
+
+    def __init__(self, bus, channel):
+        self.bus = bus
+        self.channel = channel
+
+    def _run(self):
+        self._runing = True
+        while self._runing:
+            for d in self.bus.subscriber(self.channel).listen():
+                if not d or not d.get('fkey'):
+                    continue
+                fkey = d['fkey']
+                if fkey not in self._func_map:
+                    print(fkey, 'not in self._func_map')
+                # print(os.getpid(), 'run ', fkey, d)
+                args = d['args']
+                kwargs = d['kwargs']
+                self._func_map[fkey](*args, **kwargs)
+
+    def start(self):
+        import threading
+        th = threading.Thread(target=self._run)
+        th.setDaemon(True)
+        th.start()
+        return th
+
+    def register(self, func):
+        import functools
+        functools.wraps(func)
+        fkey = func.__name__
+        if fkey in self._func_map:
+            raise Exception('%s registered', func)
+        self._func_map[fkey] = func
+        if not self._runing:
+            self.start()
+
+        def _func(*args, **kwargs):
+            d = {'fkey': fkey, 'args': args, 'kwargs': kwargs}
+            # print(os.getpid(), 'call', fkey, d)
+            self.bus.publish(self.channel, d)
+
+        return _func
+
+
 class BaseBus(object):
     channel_prefix = ''
     lock = Lock()
+    _func_bus_map = {}
 
     def _get_ful_channel(self, channel):
         return '%s%s' % (self.channel_prefix or '', channel)
@@ -73,6 +121,20 @@ class BaseBus(object):
         th.setDaemon(True)
         th.start()
         return ps
+
+    def _get_func_bus(self, channel):
+        if channel not in self._func_bus_map:
+            self._func_bus_map[channel] = FuncBus(bus=self, channel=channel)
+        return self._func_bus_map[channel]
+
+    def func_bus(self, func_or_channel=None):
+        default = 'default'
+        channel = default if callable(func_or_channel) else func_or_channel or default
+        fbus = self._get_func_bus(channel)
+        if callable(func_or_channel):
+            return fbus.register(func_or_channel)
+        else:
+            return fbus
 
 
 class RedisBus(BaseBus):
@@ -272,7 +334,7 @@ class RabbitMQBus(BaseBus):
     def create_connection(self):
         import pika
         credentials = pika.PlainCredentials(self.username, self.password) if self.username else None
-        rbmqcon = pika.BlockingConnection(pika.ConnectionParameters(host=self.host, port=self.port, credentials=credentials))
+        rbmqcon = pika.BlockingConnection(pika.ConnectionParameters(host=self.host, port=self.port, credentials=credentials, heartbeat=0))
         return rbmqcon
 
     def create_channel(self):
